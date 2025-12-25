@@ -407,4 +407,69 @@ public class ElasticsearchSinkTests
         Assert.Contains("\"@timestamp\":", body); // Top-level timestamp field is renamed
         Assert.Contains("Timestamp", body); // But user's message text "Timestamp" is preserved
     }
+
+    [Fact]
+    public void Constructor_ThrowsWhenCustomHeaderValueIsNull()
+    {
+        // Arrange - Custom headers with null value should throw at construction time
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            CustomHeaders = new Dictionary<string, string>
+            {
+                ["X-Valid-Header"] = "valid-value",
+                ["X-Null-Header"] = null!
+            }
+        };
+
+        // Act & Assert - Should throw ArgumentException with clear message about null header value
+        var ex = Assert.Throws<ArgumentException>(() => new ElasticsearchSink(options));
+        Assert.Contains("X-Null-Header", ex.Message);
+        Assert.Contains("null", ex.Message.ToLower());
+    }
+
+    [Fact]
+    public async Task EmitBatchAsync_ThrowsOnUnparseableJsonResponse()
+    {
+        // Arrange - Elasticsearch returns non-JSON response (e.g., HTML error page)
+        var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "<html>Bad Gateway</html>");
+        var httpClient = new HttpClient(handler);
+
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            HttpClientFactory = () => httpClient
+        };
+
+        var sink = new ElasticsearchSink(options);
+        var logEvent = Some.InformationEvent();
+
+        // Act & Assert - Should throw to trigger retry (unparseable response treated as error)
+        await Assert.ThrowsAsync<HttpRequestException>(
+            () => sink.EmitBatchAsync(new[] { logEvent }));
+    }
+
+    [Fact]
+    public async Task EmitBatchAsync_ThrowsOnMissingErrorsProperty()
+    {
+        // Arrange - Elasticsearch returns JSON without "errors" property (unexpected format)
+        var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "{\"took\":5,\"items\":[]}");
+        var httpClient = new HttpClient(handler);
+
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            HttpClientFactory = () => httpClient
+        };
+
+        var sink = new ElasticsearchSink(options);
+        var logEvent = Some.InformationEvent();
+
+        // Act & Assert - Should throw to trigger retry (missing property treated as error)
+        await Assert.ThrowsAsync<HttpRequestException>(
+            () => sink.EmitBatchAsync(new[] { logEvent }));
+    }
 }

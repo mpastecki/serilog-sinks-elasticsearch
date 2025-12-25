@@ -54,9 +54,24 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
 
         _indexFormat = options.IndexFormat;
         _apiKey = options.ApiKey!; // Already validated non-null/whitespace above
-        _customHeaders = options.CustomHeaders is not null
-            ? new Dictionary<string, string>(options.CustomHeaders)
-            : null;
+        if (options.CustomHeaders is not null)
+        {
+            _customHeaders = new Dictionary<string, string>(options.CustomHeaders);
+            // Validate that no header values are null to fail fast with clear error
+            foreach (var header in _customHeaders)
+            {
+                if (header.Value is null)
+                {
+                    throw new ArgumentException(
+                        $"Custom header '{header.Key}' has a null value. Header values cannot be null.",
+                        nameof(options));
+                }
+            }
+        }
+        else
+        {
+            _customHeaders = null;
+        }
 
         // Validate index format at construction time to fail fast
         try
@@ -117,6 +132,16 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
             return;
 
         var payload = FormatBulkPayload(batch);
+
+        // If all events failed to format, throw to trigger retry rather than sending empty payload
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            SelfLog.WriteLine(
+                "Elasticsearch sink: All {0} events in batch failed to format. No data will be sent.",
+                batch.Count);
+            throw new InvalidOperationException(
+                $"Failed to format any of the {batch.Count} log events in the batch. Check SelfLog for formatting errors.");
+        }
 
         using var content = new StringContent(payload, Encoding.UTF8, "application/x-ndjson");
 
@@ -191,6 +216,8 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
 
     /// <summary>
     /// Parses the bulk response to check for errors using proper JSON parsing.
+    /// Returns true (errors detected) when response cannot be parsed or is malformed,
+    /// to trigger retry behavior rather than silently dropping data.
     /// </summary>
     static bool HasBulkErrors(string responseContent)
     {
@@ -201,13 +228,20 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
             {
                 return errorsElement.ValueKind == JsonValueKind.True;
             }
-            return false;
+            // Missing "errors" property indicates unexpected response format - treat as error
+            SelfLog.WriteLine(
+                "Elasticsearch sink: Bulk response missing 'errors' property. Response: {0}",
+                responseContent.Length > 500 ? responseContent.Substring(0, 500) + "..." : responseContent);
+            return true;
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
-            // If we can't parse the response, assume no errors rather than throwing
-            SelfLog.WriteLine("Elasticsearch sink: Could not parse bulk response as JSON");
-            return false;
+            // Unparseable response is a serious problem - treat as error to trigger retry
+            SelfLog.WriteLine(
+                "Elasticsearch sink: Could not parse bulk response as JSON: {0}. Response: {1}",
+                ex.Message,
+                responseContent.Length > 500 ? responseContent.Substring(0, 500) + "..." : responseContent);
+            return true;
         }
     }
 
@@ -244,9 +278,11 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
                     sb.Append('\n');
                 }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is not OutOfMemoryException
+                                        and not StackOverflowException)
             {
                 // Log and skip problematic events instead of failing the entire batch
+                // Fatal exceptions (OOM, StackOverflow) are not caught and will propagate
                 SelfLog.WriteLine(
                     "Elasticsearch sink: Failed to format event at {0}: {1}",
                     logEvent.Timestamp,
