@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+using Serilog.Debugging;
 using Serilog.Events;
 using Serilog.Formatting;
 using Serilog.Formatting.Json;
@@ -90,7 +91,31 @@ sealed class ElasticsearchJsonFormatter : ITextFormatter
 
                 WriteQuotedJsonString(property.Key, output);
                 output.Write(':');
-                _valueFormatter.Format(property.Value, output);
+                try
+                {
+                    _valueFormatter.Format(property.Value, output);
+                }
+                catch (Exception ex)
+                {
+                    // Write a placeholder for the failed property value to maintain valid JSON.
+                    // Format: "[Error formatting value: ExceptionTypeName]"
+                    output.Write('"');
+                    output.Write("[Error formatting value: ");
+                    // Write exception type name, escaping any special chars (unlikely but safe)
+                    var exTypeName = ex.GetType().Name;
+                    foreach (var c in exTypeName)
+                    {
+                        if (c == '"' || c == '\\')
+                            output.Write('\\');
+                        output.Write(c);
+                    }
+                    output.Write(']');
+                    output.Write('"');
+                    SelfLog.WriteLine(
+                        "Elasticsearch formatter: Failed to format property '{0}': {1}",
+                        property.Key,
+                        ex.Message);
+                }
             }
             output.Write('}');
         }

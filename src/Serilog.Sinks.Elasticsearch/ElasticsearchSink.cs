@@ -143,7 +143,9 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
                 $"Failed to format any of the {batch.Count} log events in the batch. Check SelfLog for formatting errors.");
         }
 
-        using var content = new StringContent(payload, Encoding.UTF8, "application/x-ndjson");
+        // Note: Do NOT use 'using' here - content is disposed by HttpRequestMessage.Dispose()
+        // (shared path) or HttpClient.PostAsync() (owned path). Double-disposal causes issues.
+        var content = new StringContent(payload, Encoding.UTF8, "application/x-ndjson");
 
         HttpResponseMessage response;
         try
@@ -265,8 +267,10 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
                 sb.Append("\"}}\n");
 
                 // Write document line
-                var docWriter = new StringWriter(sb);
-                _formatter.Format(logEvent, docWriter);
+                using (var docWriter = new StringWriter(sb))
+                {
+                    _formatter.Format(logEvent, docWriter);
+                }
 
                 // Normalize to Unix newlines: strip any trailing \r, ensure exactly one \n
                 while (sb.Length > 0 && sb[sb.Length - 1] == '\r')
@@ -278,14 +282,17 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
                     sb.Append('\n');
                 }
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException
-                                        and not StackOverflowException)
+            catch (Exception ex) when (ex is FormatException
+                                        or ArgumentException
+                                        or IOException
+                                        or InvalidOperationException)
             {
-                // Log and skip problematic events instead of failing the entire batch
-                // Fatal exceptions (OOM, StackOverflow) are not caught and will propagate
+                // Log and skip events with known formatting/IO issues instead of failing the entire batch.
+                // Other exceptions (bugs, system failures) will propagate and trigger retry.
                 SelfLog.WriteLine(
-                    "Elasticsearch sink: Failed to format event at {0}: {1}",
+                    "Elasticsearch sink: Failed to format event at {0}. Exception: {1}: {2}",
                     logEvent.Timestamp,
+                    ex.GetType().FullName,
                     ex.Message);
             }
         }
