@@ -60,11 +60,17 @@ public class ElasticsearchLoggerConfigurationExtensionsTests
     }
 
     [Fact]
-    public void Elasticsearch_SimpleOverload_ThrowsWhenApiKeyNull()
+    public void Elasticsearch_SimpleOverload_ThrowsWhenApiKeyNullOrEmpty()
     {
-        Assert.Throws<ArgumentNullException>(() =>
+        // Null throws ArgumentException (not ArgumentNullException since it's also checked for whitespace)
+        Assert.Throws<ArgumentException>(() =>
             new LoggerConfiguration()
                 .WriteTo.Elasticsearch("https://localhost:9200", null!));
+
+        // Empty or whitespace also throws ArgumentException
+        Assert.Throws<ArgumentException>(() =>
+            new LoggerConfiguration()
+                .WriteTo.Elasticsearch("https://localhost:9200", ""));
     }
 
     [Fact]

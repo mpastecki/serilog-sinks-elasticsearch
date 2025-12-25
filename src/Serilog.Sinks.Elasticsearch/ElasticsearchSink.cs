@@ -15,11 +15,11 @@
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using Serilog.Core;
 using Serilog.Debugging;
 using Serilog.Events;
 using Serilog.Formatting;
-using Serilog.Formatting.Json;
 
 namespace Serilog.Sinks.Elasticsearch;
 
@@ -33,10 +33,12 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
 {
     readonly HttpClient _httpClient;
     readonly bool _disposeHttpClient;
+    readonly bool _isSharedHttpClient;
     readonly Uri _bulkUri;
     readonly string _indexFormat;
     readonly ITextFormatter _formatter;
-    readonly string _timestampFieldName;
+    readonly string _apiKey;
+    readonly IReadOnlyDictionary<string, string>? _customHeaders;
 
     /// <summary>
     /// Construct a sink that writes to Elasticsearch.
@@ -51,9 +53,24 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
         if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new ArgumentException("ApiKey is required.", nameof(options));
 
         _indexFormat = options.IndexFormat;
-        _timestampFieldName = options.TimestampFieldName;
-        _formatter = options.Formatter ?? new JsonFormatter(
-            closingDelimiter: null,
+        _apiKey = options.ApiKey!; // Already validated non-null/whitespace above
+        _customHeaders = options.CustomHeaders is not null
+            ? new Dictionary<string, string>(options.CustomHeaders)
+            : null;
+
+        // Validate index format at construction time to fail fast
+        try
+        {
+            _ = string.Format(_indexFormat, DateTimeOffset.UtcNow);
+        }
+        catch (FormatException ex)
+        {
+            throw new ArgumentException($"IndexFormat '{_indexFormat}' is not a valid format string: {ex.Message}", nameof(options));
+        }
+
+        // Use custom formatter with correct timestamp field, or wrap default formatter
+        _formatter = options.Formatter ?? new ElasticsearchJsonFormatter(
+            timestampFieldName: options.TimestampFieldName,
             renderMessage: options.RenderMessage);
 
         // Build bulk endpoint URI
@@ -66,29 +83,29 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
         // Create or use provided HttpClient
         if (options.HttpClientFactory is not null)
         {
-            _httpClient = options.HttpClientFactory();
+            _httpClient = options.HttpClientFactory()
+                ?? throw new ArgumentException("HttpClientFactory returned null.", nameof(options));
             _disposeHttpClient = false;
+            _isSharedHttpClient = true;
         }
         else
         {
             _httpClient = new HttpClient { Timeout = options.RequestTimeout };
             _disposeHttpClient = true;
-        }
+            _isSharedHttpClient = false;
 
-        // Set authorization header
-        _httpClient.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("ApiKey", options.ApiKey);
+            // Only set default headers on owned HttpClient (thread-safe)
+            _httpClient.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("ApiKey", _apiKey);
+            _httpClient.DefaultRequestHeaders.Accept.Add(
+                new MediaTypeWithQualityHeaderValue("application/json"));
 
-        // Set content type for NDJSON (Newline Delimited JSON)
-        _httpClient.DefaultRequestHeaders.Accept.Add(
-            new MediaTypeWithQualityHeaderValue("application/json"));
-
-        // Add custom headers if provided
-        if (options.CustomHeaders is not null)
-        {
-            foreach (var header in options.CustomHeaders)
+            if (_customHeaders is not null)
             {
-                _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+                foreach (var header in _customHeaders)
+                {
+                    _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+                }
             }
         }
     }
@@ -106,41 +123,91 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
         HttpResponseMessage response;
         try
         {
-            response = await _httpClient.PostAsync(_bulkUri, content).ConfigureAwait(false);
+            // For shared HttpClient, use HttpRequestMessage to add headers per-request (thread-safe)
+            if (_isSharedHttpClient)
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, _bulkUri);
+                request.Content = content;
+                request.Headers.Authorization = new AuthenticationHeaderValue("ApiKey", _apiKey);
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+
+                if (_customHeaders is not null)
+                {
+                    foreach (var header in _customHeaders)
+                    {
+                        request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                    }
+                }
+
+                response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            }
+            else
+            {
+                response = await _httpClient.PostAsync(_bulkUri, content).ConfigureAwait(false);
+            }
         }
         catch (HttpRequestException ex)
         {
             SelfLog.WriteLine("Elasticsearch sink: HTTP request failed: {0}", ex.Message);
             throw;
         }
-#if FEATURE_ASYNCDISPOSABLE
-        catch (TaskCanceledException ex) when (!ex.CancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException ex)
         {
-            SelfLog.WriteLine("Elasticsearch sink: Request timed out: {0}", ex.Message);
+            // Handles both TaskCanceledException (timeout) and user cancellation
+            SelfLog.WriteLine("Elasticsearch sink: Request cancelled or timed out: {0}", ex.Message);
             throw;
         }
-#endif
 
-        if (!response.IsSuccessStatusCode)
+        // Ensure response is disposed in all code paths
+        using (response)
         {
-            var responseBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-            SelfLog.WriteLine(
-                "Elasticsearch sink: Bulk request failed with status {0}: {1}",
-                (int)response.StatusCode,
-                responseBody);
+            var responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-            // Throw to trigger retry mechanism in BatchingSink
-            throw new HttpRequestException(
-                $"Elasticsearch bulk request failed with status {response.StatusCode}");
+            if (!response.IsSuccessStatusCode)
+            {
+                SelfLog.WriteLine(
+                    "Elasticsearch sink: Bulk request failed with status {0}: {1}",
+                    (int)response.StatusCode,
+                    responseContent);
+
+                // Throw to trigger retry mechanism in BatchingSink
+                throw new HttpRequestException(
+                    $"Elasticsearch bulk request failed with status {response.StatusCode}");
+            }
+
+            // Check for partial failures using proper JSON parsing
+            if (HasBulkErrors(responseContent))
+            {
+                SelfLog.WriteLine(
+                    "Elasticsearch sink: Bulk request had partial failures: {0}",
+                    responseContent);
+
+                // Throw to trigger retry - partial failures mean data loss
+                throw new HttpRequestException(
+                    "Elasticsearch bulk request had partial failures. Some documents were not indexed.");
+            }
         }
+    }
 
-        // Check for partial failures in the bulk response
-        var responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
-        if (responseContent.Contains("\"errors\":true"))
+    /// <summary>
+    /// Parses the bulk response to check for errors using proper JSON parsing.
+    /// </summary>
+    static bool HasBulkErrors(string responseContent)
+    {
+        try
         {
-            SelfLog.WriteLine(
-                "Elasticsearch sink: Bulk request had partial failures: {0}",
-                responseContent);
+            using var doc = JsonDocument.Parse(responseContent);
+            if (doc.RootElement.TryGetProperty("errors", out var errorsElement))
+            {
+                return errorsElement.ValueKind == JsonValueKind.True;
+            }
+            return false;
+        }
+        catch (JsonException)
+        {
+            // If we can't parse the response, assume no errors rather than throwing
+            SelfLog.WriteLine("Elasticsearch sink: Could not parse bulk response as JSON");
+            return false;
         }
     }
 
@@ -153,32 +220,71 @@ sealed class ElasticsearchSink : IBatchedLogEventSink, IDisposable
 
         foreach (var logEvent in batch)
         {
-            // Compute index name for this event
-            var indexName = string.Format(_indexFormat, logEvent.Timestamp);
-
-            // Write action line (Elasticsearch 8.x doesn't use document types)
-            sb.Append("{\"index\":{\"_index\":\"");
-            sb.Append(indexName);
-            sb.Append("\"}}");
-            sb.AppendLine();
-
-            // Write document line
-            using var docWriter = new StringWriter(sb);
-            _formatter.Format(logEvent, docWriter);
-
-            // Ensure the document ends with a newline
-            if (sb.Length > 0 && sb[sb.Length - 1] != '\n')
+            try
             {
-                sb.AppendLine();
+                // Compute index name for this event
+                var indexName = string.Format(_indexFormat, logEvent.Timestamp);
+
+                // Write action line with explicit \n for cross-platform NDJSON compatibility
+                sb.Append("{\"index\":{\"_index\":\"");
+                sb.Append(EscapeJsonString(indexName));
+                sb.Append("\"}}\n");
+
+                // Write document line
+                var docWriter = new StringWriter(sb);
+                _formatter.Format(logEvent, docWriter);
+
+                // Normalize to Unix newlines: strip any trailing \r, ensure exactly one \n
+                while (sb.Length > 0 && sb[sb.Length - 1] == '\r')
+                {
+                    sb.Remove(sb.Length - 1, 1);
+                }
+                if (sb.Length == 0 || sb[sb.Length - 1] != '\n')
+                {
+                    sb.Append('\n');
+                }
+            }
+            catch (Exception ex)
+            {
+                // Log and skip problematic events instead of failing the entire batch
+                SelfLog.WriteLine(
+                    "Elasticsearch sink: Failed to format event at {0}: {1}",
+                    logEvent.Timestamp,
+                    ex.Message);
             }
         }
 
-        // Replace "Timestamp" with the configured timestamp field name if different
-        if (_timestampFieldName != "Timestamp")
-        {
-            sb.Replace("\"Timestamp\":", $"\"{_timestampFieldName}\":");
-        }
+        return sb.ToString();
+    }
 
+    /// <summary>
+    /// Escapes special characters in a string for JSON.
+    /// </summary>
+    static string EscapeJsonString(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+
+        var sb = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            switch (c)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < ' ')
+                        sb.Append($"\\u{(int)c:x4}");
+                    else
+                        sb.Append(c);
+                    break;
+            }
+        }
         return sb.ToString();
     }
 

@@ -28,10 +28,12 @@ static class Some
     public static LogEvent LogEvent(
         DateTimeOffset? timestamp = null,
         LogEventLevel level = LogEventLevel.Information,
-        string? messageTemplate = null)
+        string? messageTemplate = null,
+        string? message = null)
     {
         var logger = new LoggerConfiguration().CreateLogger();
-        Assert.True(logger.BindMessageTemplate(messageTemplate ?? "Test message " + Int(), Array.Empty<object>(), out var parsedTemplate, out var boundProperties));
+        var template = message ?? messageTemplate ?? "Test message " + Int();
+        Assert.True(logger.BindMessageTemplate(template, Array.Empty<object>(), out var parsedTemplate, out var boundProperties));
         return new LogEvent(
             timestamp ?? DateTimeOffset.UtcNow,
             level,

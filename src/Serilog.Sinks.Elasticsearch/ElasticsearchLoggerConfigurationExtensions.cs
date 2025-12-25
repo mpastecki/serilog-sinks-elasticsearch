@@ -36,7 +36,8 @@ public static class ElasticsearchLoggerConfigurationExtensions
     /// <returns>Configuration object allowing method chaining.</returns>
     /// <exception cref="ArgumentNullException">When <paramref name="loggerSinkConfiguration"/> is null.</exception>
     /// <exception cref="ArgumentNullException">When <paramref name="serverUrl"/> is null.</exception>
-    /// <exception cref="ArgumentNullException">When <paramref name="apiKey"/> is null or empty.</exception>
+    /// <exception cref="ArgumentException">When <paramref name="apiKey"/> is null or empty.</exception>
+    /// <exception cref="UriFormatException">When <paramref name="serverUrl"/> is not a valid URI.</exception>
     public static LoggerConfiguration Elasticsearch(
         this LoggerSinkConfiguration loggerSinkConfiguration,
         string serverUrl,
@@ -47,7 +48,7 @@ public static class ElasticsearchLoggerConfigurationExtensions
     {
         if (loggerSinkConfiguration is null) throw new ArgumentNullException(nameof(loggerSinkConfiguration));
         if (serverUrl is null) throw new ArgumentNullException(nameof(serverUrl));
-        if (string.IsNullOrWhiteSpace(apiKey)) throw new ArgumentNullException(nameof(apiKey));
+        if (string.IsNullOrWhiteSpace(apiKey)) throw new ArgumentException("ApiKey cannot be null or empty.", nameof(apiKey));
 
         var options = new ElasticsearchSinkOptions
         {

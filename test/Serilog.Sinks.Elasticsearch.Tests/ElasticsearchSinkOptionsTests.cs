@@ -59,4 +59,58 @@ public class ElasticsearchSinkOptionsTests
         Assert.Equal("timestamp", options.TimestampFieldName);
         Assert.Equal("my-pipeline", options.Pipeline);
     }
+
+    [Fact]
+    public void IndexFormat_ThrowsWhenNull()
+    {
+        var options = new ElasticsearchSinkOptions();
+        Assert.Throws<ArgumentNullException>(() => options.IndexFormat = null!);
+    }
+
+    [Fact]
+    public void RequestTimeout_ThrowsWhenNonPositive()
+    {
+        var options = new ElasticsearchSinkOptions();
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.RequestTimeout = TimeSpan.Zero);
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.RequestTimeout = TimeSpan.FromSeconds(-1));
+    }
+
+    [Fact]
+    public void TimestampFieldName_ThrowsWhenNullOrEmpty()
+    {
+        var options = new ElasticsearchSinkOptions();
+        Assert.Throws<ArgumentException>(() => options.TimestampFieldName = null!);
+        Assert.Throws<ArgumentException>(() => options.TimestampFieldName = "");
+        Assert.Throws<ArgumentException>(() => options.TimestampFieldName = "   ");
+    }
+
+    [Fact]
+    public void Validate_ReturnsErrors_WhenRequiredFieldsMissing()
+    {
+        var options = new ElasticsearchSinkOptions();
+        var errors = options.Validate();
+
+        Assert.Contains(errors, e => e.Contains("ServerUrl"));
+        Assert.Contains(errors, e => e.Contains("ApiKey"));
+    }
+
+    [Fact]
+    public void Validate_ReturnsNoErrors_WhenValid()
+    {
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key"
+        };
+
+        var errors = options.Validate();
+        Assert.Empty(errors);
+    }
+
+    [Fact]
+    public void ThrowIfInvalid_ThrowsWhenInvalid()
+    {
+        var options = new ElasticsearchSinkOptions();
+        Assert.Throws<InvalidOperationException>(() => options.ThrowIfInvalid());
+    }
 }

@@ -23,6 +23,10 @@ namespace Serilog.Sinks.Elasticsearch;
 /// </summary>
 public class ElasticsearchSinkOptions
 {
+    string _indexFormat = "logs-{0:yyyy.MM.dd}";
+    string _timestampFieldName = "@timestamp";
+    TimeSpan _requestTimeout = TimeSpan.FromSeconds(30);
+
     /// <summary>
     /// The Elasticsearch server URL. Required.
     /// Example: "https://my-cluster.es.us-east-1.aws.elastic.cloud:443"
@@ -46,11 +50,16 @@ public class ElasticsearchSinkOptions
     /// "logs-{0:yyyy.MM}" - monthly indices
     /// "myapp-logs-{0:yyyy.MM.dd}" - prefixed daily indices
     /// </example>
-    public string IndexFormat { get; set; } = "logs-{0:yyyy.MM.dd}";
+    /// <exception cref="ArgumentNullException">When set to null.</exception>
+    public string IndexFormat
+    {
+        get => _indexFormat;
+        set => _indexFormat = value ?? throw new ArgumentNullException(nameof(value), "IndexFormat cannot be null.");
+    }
 
     /// <summary>
     /// The text formatter used to format log events as JSON for Elasticsearch.
-    /// Default: <see cref="Formatting.Json.JsonFormatter"/> with renderMessage=true.
+    /// Default: <see cref="ElasticsearchJsonFormatter"/> with the configured TimestampFieldName.
     /// </summary>
     public ITextFormatter? Formatter { get; set; }
 
@@ -62,13 +71,24 @@ public class ElasticsearchSinkOptions
 
     /// <summary>
     /// HTTP request timeout for Elasticsearch requests.
-    /// Default: 30 seconds.
+    /// Default: 30 seconds. Must be positive.
     /// </summary>
-    public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(30);
+    /// <exception cref="ArgumentOutOfRangeException">When set to zero or negative.</exception>
+    public TimeSpan RequestTimeout
+    {
+        get => _requestTimeout;
+        set
+        {
+            if (value <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(value), "RequestTimeout must be positive.");
+            _requestTimeout = value;
+        }
+    }
 
     /// <summary>
     /// Optional custom HttpClient factory. If provided, the sink will not dispose the HttpClient.
     /// Useful for scenarios where HttpClient lifecycle is managed externally (e.g., IHttpClientFactory).
+    /// Note: When using a factory-provided HttpClient, headers are added per-request for thread safety.
     /// </summary>
     public Func<HttpClient>? HttpClientFactory { get; set; }
 
@@ -87,10 +107,60 @@ public class ElasticsearchSinkOptions
     /// The name of the timestamp field in the Elasticsearch document.
     /// Default: "@timestamp" (ECS compatible).
     /// </summary>
-    public string TimestampFieldName { get; set; } = "@timestamp";
+    /// <exception cref="ArgumentException">When set to null or empty.</exception>
+    public string TimestampFieldName
+    {
+        get => _timestampFieldName;
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("TimestampFieldName cannot be null or empty.", nameof(value));
+            _timestampFieldName = value;
+        }
+    }
 
     /// <summary>
     /// The pipeline to use for ingestion. Optional.
     /// </summary>
     public string? Pipeline { get; set; }
+
+    /// <summary>
+    /// Validates the configuration and returns a list of validation errors.
+    /// </summary>
+    /// <returns>A list of validation error messages, empty if valid.</returns>
+    public IReadOnlyList<string> Validate()
+    {
+        var errors = new List<string>();
+
+        if (ServerUrl is null)
+            errors.Add("ServerUrl is required.");
+
+        if (string.IsNullOrWhiteSpace(ApiKey))
+            errors.Add("ApiKey is required.");
+
+        try
+        {
+            _ = string.Format(_indexFormat, DateTimeOffset.UtcNow);
+        }
+        catch (FormatException)
+        {
+            errors.Add($"IndexFormat '{_indexFormat}' is not a valid format string.");
+        }
+
+        return errors;
+    }
+
+    /// <summary>
+    /// Validates the configuration and throws if invalid.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">When the configuration is invalid.</exception>
+    public void ThrowIfInvalid()
+    {
+        var errors = Validate();
+        if (errors.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"ElasticsearchSinkOptions is invalid: {string.Join("; ", errors)}");
+        }
+    }
 }

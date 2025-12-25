@@ -54,7 +54,7 @@ public class ElasticsearchSinkTests
     }
 
     [Fact]
-    public async Task EmitBatchAsync_SetsAuthorizationHeader()
+    public async Task EmitBatchAsync_SetsAuthorizationHeader_ForSharedHttpClient()
     {
         // Arrange
         var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "{\"errors\":false}");
@@ -73,7 +73,7 @@ public class ElasticsearchSinkTests
         // Act
         await sink.EmitBatchAsync(new[] { logEvent });
 
-        // Assert
+        // Assert - For shared HttpClient, authorization is added per-request to request headers
         var request = handler.Requests[0];
         Assert.Equal("ApiKey", request.Headers.Authorization?.Scheme);
         Assert.Equal("my-secret-key", request.Headers.Authorization?.Parameter);
@@ -301,9 +301,110 @@ public class ElasticsearchSinkTests
         // Act
         await sink.EmitBatchAsync(new[] { logEvent });
 
-        // Assert
+        // Assert - For shared HttpClient, custom headers are added per-request to request headers
         var request = handler.Requests[0];
         Assert.True(request.Headers.TryGetValues("X-Custom-Header", out var values));
         Assert.Contains("custom-value", values);
+    }
+
+    [Fact]
+    public async Task EmitBatchAsync_ThrowsOnPartialFailures()
+    {
+        // Arrange - Elasticsearch returns 200 OK but with errors:true
+        var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "{\"errors\":true,\"items\":[{\"index\":{\"error\":{\"reason\":\"test\"}}}]}");
+        var httpClient = new HttpClient(handler);
+
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            HttpClientFactory = () => httpClient
+        };
+
+        var sink = new ElasticsearchSink(options);
+        var logEvent = Some.InformationEvent();
+
+        // Act & Assert - Should throw to trigger retry
+        await Assert.ThrowsAsync<HttpRequestException>(
+            () => sink.EmitBatchAsync(new[] { logEvent }));
+    }
+
+    [Fact]
+    public void Constructor_ThrowsWhenHttpClientFactoryReturnsNull()
+    {
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            HttpClientFactory = () => null!
+        };
+
+        Assert.Throws<ArgumentException>(() => new ElasticsearchSink(options));
+    }
+
+    [Fact]
+    public void Constructor_ThrowsOnInvalidIndexFormat()
+    {
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            IndexFormat = "logs-{1:yyyy.MM.dd}" // Wrong argument index
+        };
+
+        Assert.Throws<ArgumentException>(() => new ElasticsearchSink(options));
+    }
+
+    [Fact]
+    public async Task EmitBatchAsync_PayloadHasUnixNewlines()
+    {
+        // Arrange
+        var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "{\"errors\":false}");
+        var httpClient = new HttpClient(handler);
+
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            HttpClientFactory = () => httpClient
+        };
+
+        var sink = new ElasticsearchSink(options);
+        var logEvent = Some.InformationEvent();
+
+        // Act
+        await sink.EmitBatchAsync(new[] { logEvent });
+
+        // Assert - NDJSON must use \n, not \r\n
+        var body = handler.RequestBodies[0];
+        Assert.DoesNotContain("\r\n", body);
+        Assert.Contains("\n", body);
+    }
+
+    [Fact]
+    public async Task EmitBatchAsync_TimestampFieldNotCorruptedByUserData()
+    {
+        // Arrange - Log message contains the word "Timestamp" which should NOT be replaced
+        var handler = new MockHttpMessageHandler(HttpStatusCode.OK, "{\"errors\":false}");
+        var httpClient = new HttpClient(handler);
+
+        var options = new ElasticsearchSinkOptions
+        {
+            ServerUrl = new Uri("https://localhost:9200"),
+            ApiKey = "test-key",
+            TimestampFieldName = "@timestamp",
+            HttpClientFactory = () => httpClient
+        };
+
+        var sink = new ElasticsearchSink(options);
+        var logEvent = Some.LogEvent(message: "Check the Timestamp field");
+
+        // Act
+        await sink.EmitBatchAsync(new[] { logEvent });
+
+        // Assert - The message should NOT have "@timestamp" in it
+        var body = handler.RequestBodies[0];
+        Assert.Contains("\"@timestamp\":", body); // Top-level timestamp field is renamed
+        Assert.Contains("Timestamp", body); // But user's message text "Timestamp" is preserved
     }
 }
